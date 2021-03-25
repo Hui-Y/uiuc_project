@@ -1,0 +1,1178 @@
+---
+title: "County-level COVID-19 Analysis"
+author: "Linglong Ma, Tianqi Qu, Hui Yang (Leader)"
+output:
+  pdf_document: default
+  html_document: 
+    theme: cosmo
+    toc: yes
+urlcolor: BrickRed
+---
+
+```{r, setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = 'center')
+```
+
+```{r, load-packages, include = FALSE}
+library(tidyverse)
+library(caret)
+library(tibble)
+library(kableExtra)
+library(randomForest)
+library(glmnet)
+library(purrr)
+library(ggplot2)
+library(gridExtra)
+library(mgcv)
+library(party)
+library(e1071)
+library(class)
+library(klaR)
+library(xgboost)
+library(dplyr)
+library(kohonen)
+library(umap)
+```
+
+## Introduction
+
+The COVID-19 pandemic has had far-reaching consequences beyond the spread of the disease itself and has left a huge social implications. While people have done lots of researches and had some knowledge regarding this pandemic, we always hope to devote more efforts to understand and quarantine it. With a general hope to have a better understanding of COVID-19 pandemic, we apply supervised and unsupervised learning methods to county-level data and try to figure out underlying pattern of the infection and make some prediction. In detail, our goal is to find out the vulnerable population, propose prevention measures to reduce mortality, and predict the death counts for each county. In this project, we develop four clustering methods to the demographics and health-related information and preform mean analysis based on different clusters. We define a new class variable to represent the levels of mortality (deaths per 100,000 population), and apply four classification methods to model the variable. We also use four regression methods to predict the number of deaths one week from Apr 22. Specifically, we take the number of deaths in neighboring county into consideration, and it has positive impact on performance of our models. The clustering and the classification results indicate that the population density is significant factor to the confirmed case and death counts and the population with other disease such as diabetes, heart disease, stroke, and smoking habit is more likely to be infected. The regression results provide us with a tool to predict short-term death counts, but the model is not suitable for long-term prediction. The hope is that if including some predictors regarding policies implications and perform modeling to each county respectively, we may get a better prediction. All the effort in the project may lead to a deeper understanding to the COVID-19 pandemic.
+
+## Literature Review
+
+There have been many papers related to COVID-19 and its prediction. Yu’s paper builds 5 predictors to forecast county-level death counts in the United States [^1]. A separate-county exponential predictor uses only data from that county to predict deaths in that county. A shared-county exponential predictor uses data from all counties to predict death counts for individual counties. An expanded shared-county exponential predictor uses all data including cases and deaths in neighbor counties to do prediction. A demographic shared-county exponential predictor also includes county demographic and health-related predictive features. And finally, a separate-county linear predictor which uses only data from that county to build a linear model to predict the deaths in that county. In all, the Combined Linear and Exponential Predictors (CLEP), which combines county-specific exponential and linear predictors, has the highest accuracy in predicting most of the cases in the United States in the short term. Yuan’s paper aims at predicting daily incidence and deaths of COVID-19 in the United States, and it uses the related terms to perform Pearson correlation test and general linear model to examine correlations and predict future trends, respectively [^2]. Hao’s paper makes prediction with the model based on the Eyring’s Rate Process Theory and Free Volume Concept [^3]. While all these methods can perfectly predict the future trend of COVID-19 to some extent, there still exist many uncertainties such as the highly dynamic nature of COVID-19 and randomness of human interactions that may affect the accuracy of prediction. For instance, Neil’s paper puts that non-pharmaceutical interventions (NPIs) such as staying at home and keeping social distance might have some impacts on the reduction of COVID-19 mortality [^4].
+
+## Data
+
+### Description & Cleaning
+
+The dataset used for this analysis is a subset of the COVID-19 data repository from Prof. Bin Yu’s group, which contains 276 COVID-19 related variables for 3142 county-level observations. However, not all the variables are needed in our analysis, and the COVID19 dataset has 240 variables after deleting unnecessary columns. We found out that there are 7 variables that have missing values, in order to fix that, we calculated the Euclidean distance between each county using their latitude and longitude and then created a list called neighbor_county3 to display the nearest 2 counties of each county. For the two variables indicating the number of people enrolled in Medicare, we refilled them using the population of this county times the average percentage of Medicare enrollment in the two neighboring counties, if one of the neighbors has zero enrollment, then it will only be the population times the non-zero percentage. Similarly, we replaced the missing value of disease related variables and the ratio of votes in the presidential election with the average value of nearest two neighbor counties. Then we checked the dataset again, there is not any missing value now.
+
+```{r, load-data, message = FALSE}
+covid19_raw = read.csv("county_data_apr22.csv")
+```
+
+```{r, subset, include = FALSE}
+# subset
+covid19 = covid19_raw %>%
+  dplyr::select(countyFIPS, CountyName, StateName, POP_LATITUDE, POP_LONGITUDE, 15:24, 26:29, 31:35, dem_to_rep_ratio, 37:64, stay.at.home, 89:180, 181:272, tot_cases, tot_deaths)
+```
+
+```{r, neighboring-counties, include = FALSE}
+# neighboring counties
+state_index = c(sort(unique(covid19$StateName)))
+
+neighbor_county = list() # pairs of countyFIPS
+neighbor_county2 = list() # pairs of row numbers
+neighbor_county3 = list() # 2 nearest neighbor
+for (n in 1:length(state_index)){
+  neighbor = covid19 %>%
+    filter(StateName == state_index[n]) %>%
+    dplyr::select(countyFIPS, POP_LATITUDE, POP_LONGITUDE)
+  # calculate distance
+  alldist = as.matrix(dist(neighbor[, -1], method = "euclidean", upper = T, diag = 0))
+  
+  nc = matrix(NA, nrow(neighbor), 2) # countyFIP
+  nc2 = matrix(NA, nrow(neighbor), 2) # row number
+  nc3 = matrix(NA, nrow(neighbor), 3)
+  for (i in 1:nrow(neighbor)){
+    index = which.min(alldist[-i, i]); index2 = order(alldist[-i, i])[2]
+    subnc = matrix(c(neighbor$countyFIPS[i], neighbor$countyFIPS[index]), 1, 2)
+    nc[i, ] = subnc
+    ori = which(covid19$countyFIPS == neighbor$countyFIPS[i])
+    nb = which(covid19$countyFIPS == neighbor$countyFIPS[index])
+    nc2[i, ] = cbind(ori, nb)
+    nb2 = which(covid19$countyFIPS == neighbor$countyFIPS[index2])
+    nc3[i, ] = cbind(ori, nb, nb2)
+  }
+  neighbor_county[[n]] = nc; neighbor_county2[[n]] = nc2; neighbor_county3[[n]] = nc3
+}
+```
+
+```{r, cleaning1, include = FALSE}
+# check for missing values
+count_na = function(x){
+  sum(is.na(x))
+}
+
+covid19_miss = apply(covid19, 2, count_na)
+covid19_miss[covid19_miss != 0]
+```
+
+```{r, cleaning2, include = FALSE}
+# fill the missing values with neighboring counties'
+covid19_pre = covid19
+covid19_pre[is.na(covid19_pre)] = 0
+```
+
+```{r, cleaning3, include = FALSE}
+var_index = c(14, 15, 16, 17, 18, 25) # v
+
+# X.EligibleforMedicare2018, MedicareEnrollment.AgedTot2017
+for (v1 in 1:2){
+  submiss = covid19[is.na(covid19[, var_index[v1]]), ]
+  for (i in 1:nrow(submiss)){
+    id = submiss[i, 1]
+    n_index = which(as.factor(state_index) == submiss[i, 3])
+    pre = neighbor_county[[n_index]]
+    i_index = which(pre[, 1] == id)
+    
+    c_index = neighbor_county3[[n_index]][i_index, 1]
+    nbc_index = neighbor_county3[[n_index]][i_index, 2]
+    nbc_index2 = neighbor_county3[[n_index]][i_index, 3]
+    
+    nbc1 = covid19_pre[nbc_index, var_index[v1]]
+    nbc2 = covid19_pre[nbc_index2, var_index[v1]]
+    cpop = covid19[c_index, 6]
+    nbpop1 = covid19[nbc_index, 6]
+    nbpop2 = covid19[nbc_index2, 6]
+    
+    # X.EligibleforMedicare2018/PopulationEstimate2018
+    # MedicareEnrollment.AgedTot2017/PopulationEstimate2018
+    if (nbc1 != 0 & nbc2 != 0) {
+      covid19[c_index, var_index[v1]] = (nbc1 * cpop/nbpop1 + nbc2 * cpop/nbpop2)/2 
+    }
+    else {
+      covid19[c_index, var_index[v1]] = nbc1 * cpop/nbpop1 + nbc2 * cpop/nbpop2
+    }
+  }
+}
+```
+
+```{r, cleaning4, include = FALSE}
+# DiabetesPercentage, HeartDiseaseMortality, StrokeMortality, dem_to_rep_ratio
+for (v3 in 3:6){
+  submiss2 = covid19[is.na(covid19[, var_index[v3]]), ]
+  for (i in 1:nrow(submiss2)){
+    id = submiss2[i, 1]
+    n_index = which(as.factor(state_index) == submiss2[i, 3])
+    pre = neighbor_county[[n_index]]
+    i_index = which(pre[, 1] == id)
+    c_index = neighbor_county3[[n_index]][i_index, 1]
+    nbc_index = neighbor_county3[[n_index]][i_index, 2]
+    nbc_index2 = neighbor_county3[[n_index]][i_index, 3]
+    
+    nbc1 = covid19_pre[nbc_index, var_index[v3]]
+    nbc2 = covid19_pre[nbc_index2, var_index[v3]]
+    
+    if (nbc1 != 0 & nbc2 != 0) {
+      covid19[c_index, var_index[v3]] = (nbc1 + nbc2)/2 
+    }
+    else {
+      covid19[c_index, var_index[v3]] = nbc1 + nbc2
+    }
+  }
+}
+```
+
+## Analysis
+
+### Clustering
+
+#### Data
+
+```{r, include = FALSE}
+# pre-process data
+covid_sub1 = covid19 %>%
+  mutate(pop_total = PopTotalMale2017 + PopTotalFemale2017,
+         under65 = 1 - PopulationEstimate65.2017/pop_total,
+         above65 = 1 - under65,
+         medicare = MedicareEnrollment.AgedTot2017/pop_total,
+         hosp_emp = X.FTEHospitalTotal2017/(pop_total/100000),
+         hosp_MD = TotalM.D..s.TotNon.FedandFed2017/(pop_total/100000),
+         hosp = X.Hospitals/(pop_total/1000000),
+         icu = X.ICU_beds/(pop_total/100000),
+         tot_cases = tot_cases/(pop_total/100000),
+         tot_deaths = tot_deaths/(pop_total/100000)) %>%
+  rename(pop_density = PopulationDensityperSqMile2010,
+         diabetes_pct = DiabetesPercentage,
+         smokers_pct = Smokers_Percentage,
+         heart_mort = HeartDiseaseMortality, 
+         stroke_mort = StrokeMortality) %>%
+  dplyr::select(pop_total, pop_density, under65, above65, medicare, diabetes_pct, smokers_pct, heart_mort, stroke_mort, hosp_emp, hosp, icu, tot_cases, tot_deaths)
+```
+
+```{r, include = FALSE}
+# descriptive statistics
+covid_stats = data.frame(Mean=apply(covid_sub1, 2, mean), # mean
+                         Med=apply(covid_sub1, 2, median), # median
+                         SD=apply(covid_sub1, 2, sd), # Standard deviation
+                         Min=apply(covid_sub1, 2, min), # minimum
+                         Max=apply(covid_sub1, 2, max) # maximum
+)
+covid_stats = round(covid_stats, 2)
+
+tibble(
+  "Variables" = c("Total Population", "Population Density", "Under65", "Above 65", "Medicare Enrollment", "Diabetes Percent", "Smokers Percent", "Heart Mortality", "Stroke Mortality", "Hospital Employees", "Hospital", "ICU", "Total Cases", "Total Deaths"),
+  "Mean" = covid_stats[, 1],
+  "Median" = covid_stats[, 2],
+  "Standard Deviation" = covid_stats[, 3],
+  "Min" = covid_stats[, 4],
+  "Max" = covid_stats[, 5]) %>% 
+kable(caption = "Descriptive Statistics") %>% 
+kable_styling("striped", full_width = FALSE, position = "center")
+```
+
+```{r}
+# standardize data
+covid_scale = scale(covid_sub1)
+```
+
+Before clustering, we need to select some useful variables including demographics, health-related information and COVID-19 case/death counts. For the convenience of comparison between different counties, we divide some demographics variables by the total population to get their percentage, then divide health-related variables by total population divided by one hundred thousand to reduce the impact of different population bases. The range of total population is very large, meaning some counties have extremely small population and some have extremely large population. So, it is necessary to eliminate the influence of total population on other variables. And we also scale the data.
+
+#### Hierarchical Clustering
+
+```{r}
+# hierarchical
+set.seed(1)
+covid_hc1 = hclust(dist(covid_scale), method = "complete")
+```
+
+```{r, fig.width = 7, fig.height = 5, fig.align = "center", include = FALSE}
+# plot dendrogram and get four clusters
+plot(covid_hc1, hang=-1, cex=0.5, labels = NULL)
+group1 = cutree(covid_hc1, k=4)
+```
+
+```{r}
+# cluster distribution
+table_hc1 = table(group1)
+tibble(
+  "Cluster 1" = as.vector(table_hc1[1]),
+  "Cluster 2" = as.vector(table_hc1[2]),
+  "Cluster 3" = as.vector(table_hc1[3]),
+  "Cluster 4" = as.vector(table_hc1[4])) %>% 
+kable(caption = "Hierarchical Clusters Distribution") %>% 
+kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+```{r}
+# pca
+covid_cord = prcomp(covid_scale)$rotation[, 1:7]
+covid_pca = covid_scale %*% covid_cord
+```
+
+```{r}
+# hierarchical after pca
+set.seed(1)
+covid_hc2 = hclust(dist(covid_pca), method = "complete")
+```
+
+```{r, fig.width = 4, fig.height = 3, fig.align = "center", include = FALSE}
+# plot dendrogram and get four clusters
+plot(covid_hc2, hang=-1, cex=0.5, labels = NULL)
+group2 = cutree(covid_hc2, k=4)
+```
+
+```{r}
+# cluster distribution after pca
+table_hc2 = table(group2)
+tibble(
+  "Cluster 1" = as.vector(table_hc2[1]),
+  "Cluster 2" = as.vector(table_hc2[2]),
+  "Cluster 3" = as.vector(table_hc2[3]),
+  "Cluster 4" = as.vector(table_hc2[4])) %>% 
+kable(caption = "Hierarchical Clusters Distribution after PCA") %>% 
+kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+We use demographics, health related variables and counts which are 14 variables in total to make hierarchical clustering with complete linkage. The result of dendrogram (see details in code) is not very good. It seems that there are some extreme values. If we select 4 clusters, over 3000 observations fall into cluster 2. Other clusters only have few observations. Thus, we need to make some improvement.
+
+Consider many variables used in clustering have high correlations which may influence the result, we use PCA method to transform these variables to be unrelated and reduce the dimension. The dendrogram does not show much improvement after using PCA, and most observations still fall into the same cluster. Using other linkages also does not get a good cluster result. It seems that hierarchical clustering is not a good choice for our data.
+
+#### K-Means Clustering
+
+```{r}
+# kmeans
+set.seed(1)
+covid_km = kmeans(covid_scale, centers = 4, nstart = 20)
+```
+
+```{r}
+# cluster distribution
+table_km = table(covid_km$cluster)
+tibble(
+  "Cluster 1" = as.vector(table_km[1]),
+  "Cluster 2" = as.vector(table_km[2]),
+  "Cluster 3" = as.vector(table_km[3]),
+  "Cluster 4" = as.vector(table_km[4])) %>% 
+kable(caption = "K-means Clusters Distribution") %>% 
+kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+We choose 4 initial centers for K-means clustering. There are about 45 observations in cluster 1 which has the largest population density. It is reasonable because these big counties are just a small part. And other clusters have similar number of counties.
+
+```{r}
+# check cluster results
+covid_scale_km = cbind(cluster = covid_km$cluster, covid_sub1)
+covid_stats_km = as.data.frame(covid_scale_km) %>%
+  group_by(cluster) %>%
+  summarise_all(mean)
+```
+
+```{r}
+# mean analysis
+tibble(
+  "Cluster" = c("1", "2", "3", "4"),
+  "Population" = covid_stats_km[, 2],
+  "Density" = round(covid_stats_km[, 3], 3),
+  "> 65" = round(covid_stats_km[, 5], 2),
+  "Diabetes" = round(covid_stats_km[, 7], 2),
+  "Smokers" = round(covid_stats_km[, 8], 2), 
+  "Heart" = round(covid_stats_km[, 9], 2), 
+  "Stroke" = round(covid_stats_km[, 10], 2), 
+  "ICU" = round(covid_stats_km[, 13], 2), 
+  "Cases" = round(covid_stats_km[, 14], 2), 
+  "Deaths" = round(covid_stats_km[, 15], 2)) %>% 
+kable(caption = "Mean Analysis for K-means Clustering") %>% 
+kable_styling("striped", full_width = TRUE, position = "center", font_size = 6)
+```
+
+And we make a mean analysis based on different clusters. We can find that cluster 1 has the largest population density which leads to the most cases and deaths. Cluster 2 has the smallest population density and its cases and deaths are the least. Even though cluster 2 has more old people over 65 and less ICU beds, its COVID-19 counts are still not higher than others, meaning these factors do not have much influence on the total COVID-19 counts. Comparing cluster 3 and 4, we can find that cluster 3 has more population than 4 such that it has more cases. But the death counts of cluster 3 are a little smaller than 4. It may because people of cluster 4 have a higher proportion of diseases. So, these diseases can lead to a higher mortality rate. 
+
+```{r, warning = FALSE, fig.width = 6, fig.height = 3, fig.align = "center"}
+# plot the geographical distribution of clusters
+covid_sub2 = as.data.frame(cbind(cluster = covid_km$cluster, lat = covid19$POP_LATITUDE, lon = covid19$POP_LONGITUDE))
+ggplot(covid_sub2,aes(x = lon, y = lat)) + 
+  geom_point(aes(col = cluster), size = 0.2) +
+  xlim(c(-130, -60)) + ylim(c(27, 50)) +
+  labs(title = "K-means Clusters Geographical Distribution", x = "Longitude", y = "Latitude") +
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+```
+
+We can get the distribution of these clusters according to the longitude and latitude of counties. The figure shows that most high population density counties in cluster 1 are at the east and south of United States. Cluster 4 is at the middle area. Cluster 2 and 3 are at the west area. 
+
+```{r}
+# combine cluster label with data
+covid_sub3 = cbind(covid_km$cluster, covid_sub1[, 1], covid19[, 55:146], covid19[, 147:238])
+
+# calculate mean cases and deaths for each cluster
+cluster_km1 = covid_sub3[which(covid_sub3[, 1] == 1), 2:186]
+cluster_km2 = covid_sub3[which(covid_sub3[, 1] == 2), 2:186]
+cluster_km3 = covid_sub3[which(covid_sub3[, 1] == 3), 2:186]
+cluster_km4 = covid_sub3[which(covid_sub3[, 1] == 4), 2:186]
+
+sum_cluster_km1 = apply(cluster_km1, 2, sum)
+sum_cluster_km2 = apply(cluster_km2, 2, sum)
+sum_cluster_km3 = apply(cluster_km3, 2, sum)
+sum_cluster_km4 = apply(cluster_km4, 2, sum)
+
+grow_cluster_km1 = round(sum_cluster_km1[-1]/(sum_cluster_km1[1]/10000000), 0)
+grow_cluster_km2 = round(sum_cluster_km2[-1]/(sum_cluster_km2[1]/10000000), 0)
+grow_cluster_km3 = round(sum_cluster_km3[-1]/(sum_cluster_km3[1]/10000000), 0)
+grow_cluster_km4 = round(sum_cluster_km4[-1]/(sum_cluster_km4[1]/10000000), 0)
+```
+
+```{r}
+# build date as x-axis
+x_date = seq(as.Date("2020-1-22"), as.Date("2020-4-22"), 1)
+```
+
+```{r,  fig.width = 9, fig.height = 5, fig.align = "center"}
+# covid cases growing of each cluster
+cases_grow_km = data.frame(date = x_date, grow_cluster_km1[1:92], grow_cluster_km2[1:92], grow_cluster_km3[1:92], grow_cluster_km4[1:92])
+gg_km1 = ggplot(cases_grow_km) +
+  geom_line(aes(date, grow_cluster_km1[1:92], color = "1"))+
+  geom_line(aes(date, grow_cluster_km2[1:92], color = "2")) +
+  geom_line(aes(date, grow_cluster_km3[1:92], color = "3")) +
+  geom_line(aes(date, grow_cluster_km4[1:92], color = "4")) +
+  labs(title = "K-means COVID-19 Cases Growing", x = "Date", y = "Total Cases") +
+  scale_colour_manual(name = "Cluster", values = c('1' = "firebrick", '2' = "deepskyblue", '3' = "darkorange", '4' = "lightgreen"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, fig.width = 9, fig.height = 5, fig.align = "center"}
+# covid deaths growing of each cluster
+deaths_grow_km = data.frame(date = x_date, grow_cluster_km1[93:184], grow_cluster_km2[93:184], grow_cluster_km3[93:184], grow_cluster_km4[93:184])
+gg_km2 = ggplot(deaths_grow_km) +
+  geom_line(aes(date, grow_cluster_km1[93:184], color = "1")) +
+  geom_line(aes(date, grow_cluster_km2[93:184], color = "2")) +
+  geom_line(aes(date, grow_cluster_km3[93:184], color = "3")) + 
+  geom_line(aes(date, grow_cluster_km4[93:184], color = "4")) +
+  labs(title = "K-means COVID-19 Deaths Growing", x = "Date", y = "Total Deaths") +
+  scale_colour_manual(name = "Cluster", values = c('1' = "firebrick", '2' = "deepskyblue", '3' = "darkorange", '4' = "lightgreen"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, fig.width = 12, fig.height = 4}
+# plot
+gridExtra::grid.arrange(gg_km1, gg_km2, ncol = 2)
+```
+
+Then, we try to find the pattern of COVID-19 counts growing based on clusters. The growing rates of cases and deaths are decreasing from cluster 1, cluster 3, cluster 4 and cluster 2. It matches our previous analysis. The population of these four clusters is decreasing in the same order. We consider that the population is the most important factor for the COVID-19 cases and deaths growing. 
+
+#### Self-Organizing Map
+
+```{r}
+# som
+set.seed(1)
+covid_som = supersom(data = covid_scale, grid = somgrid(xdim = 2, ydim = 2, topo = "hexagonal"))
+```
+
+```{r}
+# cluster distribution
+table_som = table(covid_som$unit.classif)
+tibble(
+  "Cluster 1" = as.vector(table_som[1]),
+  "Cluster 2" = as.vector(table_som[2]),
+  "Cluster 3" = as.vector(table_som[3]),
+  "Cluster 4" = as.vector(table_som[4])) %>% 
+kable(caption = "SOM Clusters Distribution") %>% 
+kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+```{r, fig.width = 12, fig.height = 4, fig.align = "center"}
+# plot
+par(mfrow = c(1,3))
+plot(covid_som, type = "dist.neighbours")
+plot(covid_som, type = "mapping")
+plot(covid_som, type = "codes")
+```
+
+To be consistent with the previous method, we select the 2 × 2 grid for SOM. The number of observation of each cluster is also similar to K-means. The neighbour distance plot shows that cluster 1 and cluster 4 have higher neighbour distance indicating dissimilar. And low neighbour distance of cluster 2 and 3 indicates they are similar. Mapping plot shows how many objects are mapped into each cluster. The cluster 4 has the least number of objects and other clusters have similar number of objects.
+
+```{r}
+# check cluster results
+covid_scale_som = cbind(cluster = covid_som$unit.classif, covid_sub1)
+covid_stats_som = as.data.frame(covid_scale_som) %>%
+  group_by(cluster) %>%
+  summarise_all(mean)
+```
+
+```{r}
+# mean analysis
+tibble(
+  "Cluster" = c("1", "2", "3", "4"),
+  "Population" = covid_stats_som[, 2],
+  "Density" = round(covid_stats_som[, 3], 2),
+  "> 65" = round(covid_stats_som[, 5], 2),
+  "Diabetes" = round(covid_stats_som[, 7], 2),
+  "Smokers" = round(covid_stats_som[, 8], 2), 
+  "Heart" = round(covid_stats_som[, 9], 2), 
+  "Stroke" = round(covid_stats_som[, 10], 2), 
+  "ICU" = round(covid_stats_som[, 13], 2), 
+  "Cases" = round(covid_stats_som[, 14], 2), 
+  "Deaths" = round(covid_stats_som[, 15], 2)) %>% 
+kable(caption = "Mean Analysis for SOM") %>% 
+kable_styling("striped", full_width = TRUE, position = "center", font_size = 6)
+```
+
+Combining the codes plot and mean analysis, we can find that the result of SOM is similar to K-means. Cluster 4 has the largest population density which cause more cases and deaths. Cluster 3 has second largest population density so its cases are the second. But its deaths is less than cluster 1 because cluster 1 has more people with diseases. Cluster 2 has the least population so its cases and deaths are the least. More old people and less ICU beds do not lead to much more cases and deaths of cluster 2. 
+
+```{r, warning = FALSE, fig.width = 9, fig.height = 5, fig.align = "center", include = FALSE}
+# plot the geographical distribution of clusters
+covid_sub4 = as.data.frame(cbind(cluster = covid_som$unit.classif, lat = covid19$POP_LATITUDE, lon = covid19$POP_LONGITUDE))
+ggplot(covid_sub4) + 
+  geom_point(aes(x = lon, y = lat, col = cluster), cex = 0.9) +
+  xlim(c(-130, -60)) + ylim(c(27, 50)) +
+  labs(title = "SOM Clusters Geographical Distribution", x = "Longitude", y = "Latitude") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+# combine cluster label with data
+covid_sub5 = cbind(covid_som$unit.classif, covid_sub1[, 1], covid19[, 55:146], covid19[, 147:238])
+
+# calculate mean cases and deaths for each cluster
+cluster_som1 = covid_sub5[which(covid_sub5[, 1] == 1), 2:186]
+cluster_som2 = covid_sub5[which(covid_sub5[, 1] == 2), 2:186]
+cluster_som3 = covid_sub5[which(covid_sub5[, 1] == 3), 2:186]
+cluster_som4 = covid_sub5[which(covid_sub5[, 1] == 4), 2:186]
+
+sum_cluster_som1 = apply(cluster_som1, 2, sum)
+sum_cluster_som2 = apply(cluster_som2, 2, sum)
+sum_cluster_som3 = apply(cluster_som3, 2, sum)
+sum_cluster_som4 = apply(cluster_som4, 2, sum)
+
+grow_cluster_som1 = round(sum_cluster_som1[-1]/(sum_cluster_som1[1]/10000000), 0)
+grow_cluster_som2 = round(sum_cluster_som2[-1]/(sum_cluster_som2[1]/10000000), 0)
+grow_cluster_som3 = round(sum_cluster_som3[-1]/(sum_cluster_som3[1]/10000000), 0)
+grow_cluster_som4 = round(sum_cluster_som4[-1]/(sum_cluster_som4[1]/10000000), 0)
+```
+
+```{r,  fig.width = 9, fig.height = 5, fig.align = "center"}
+# covid cases growing of each cluster
+cases_grow_som = data.frame(date = x_date, grow_cluster_som1[1:92], grow_cluster_som2[1:92], grow_cluster_som3[1:92], grow_cluster_som4[1:92])
+gg_som1 = ggplot(cases_grow_som) +
+  geom_line(aes(date, grow_cluster_som1[1:92], color = "1"))+
+  geom_line(aes(date, grow_cluster_som2[1:92], color = "2")) +
+  geom_line(aes(date, grow_cluster_som3[1:92], color = "3")) +
+  geom_line(aes(date, grow_cluster_som4[1:92], color = "4")) +
+  labs(title = "SOM COVID-19 Cases Growing", x = "Date", y = "Total Cases") +
+  scale_colour_manual(name = "Cluster", values = c('1' = "firebrick", '2' = "deepskyblue", '3' = "darkorange", '4' = "lightgreen"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, fig.width = 9, fig.height = 5, fig.align = "center"}
+# covid deaths growing of each cluster
+deaths_grow_som = data.frame(date = x_date, grow_cluster_som1[93:184], grow_cluster_som2[93:184], grow_cluster_som3[93:184], grow_cluster_som4[93:184])
+gg_som2 = ggplot(deaths_grow_som) +
+  geom_line(aes(date, grow_cluster_som1[93:184], color = "1")) +
+  geom_line(aes(date, grow_cluster_som2[93:184], color = "2")) +
+  geom_line(aes(date, grow_cluster_som3[93:184], color = "3")) + 
+  geom_line(aes(date, grow_cluster_som4[93:184], color = "4")) +
+  labs(title = "SOM COVID-19 Deaths Growing", x = "Date", y = "Total Deaths") +
+  scale_colour_manual(name = "Cluster", values = c('1' = "firebrick", '2' = "deepskyblue", '3' = "darkorange", '4' = "lightgreen"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, fig.width = 12, fig.height = 4}
+# plot
+gridExtra::grid.arrange(gg_som1, gg_som2, ncol = 2)
+```
+
+As in the K-means analysis, cluster 4 which has the largest population has the highest cases growing rate, and the growing rate become smaller when the population is decreasing. The growing rate of cluster 4 is significantly higher than others, which can also prove the influence of large population on the growing of COVID-19. More people will cause more counts and higher growing rate.
+
+#### Uniform Manifold Approximation and Projection
+
+```{r}
+# umap
+covid_umap = umap(covid_scale)
+```
+
+```{r, fig.width = 9, fig.height = 5, fig.align="center"}
+# plot of K-means
+covid_sub6 = as.data.frame(cbind(cluster = covid_km$cluster, x1 = covid_umap$layout[, 1], x2 = covid_umap$layout[, 2]))
+gg_umap1 = ggplot(covid_sub6) + 
+  geom_point(aes(x1, x2, col = factor(cluster)), size = 0.2) +
+  labs(title = "UMAP for K-means", x = "x1", y = "x2") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r, fig.width = 9, fig.height = 5, fig.align = "center"}
+# plot of SOM
+covid_sub7 = as.data.frame(cbind(cluster = covid_som$unit.classif, x1 = covid_umap$layout[, 1], x2 = covid_umap$layout[, 2]))
+gg_umap2 = ggplot(covid_sub7) + 
+  geom_point(aes(x1, x2, col = factor(cluster)), size = 0.2) +
+  labs(title = "UMAP for SOM", x = "x1", y = "x2") +
+  theme(plot.title = element_text(hjust = 0.5))
+```  
+
+```{r, fig.width = 12, fig.height = 4}
+# plot
+gridExtra::grid.arrange(gg_umap1, gg_umap2, ncol = 2)
+```
+
+We can use UMAP to reduce the dimension of high-dimensional data and visualize it. By using UMAP method, we can project the points of high-dimensional space into low-dimensional space and retain the data structure as much as possible, then show the distribution of data in the low-dimensional space. After using UMAP, we can see the plot of K-means and SOM. The clusters distribution of these two methods are very close, which can also reflect the similar results of them. 
+
+#### Discussion
+
+For total cases and deaths, more base population will lead to more cases and deaths counts. Besides, the health condition such as diabetes, smoke and heart diseases will also cause more death counts of COVID-19. For the growing of cases and deaths, the base population is also the most important factor. If there are more population or density, the growing rate will be far greater than other counties which have less population. It is reasonable because COVID-19 can be spread by contact. If there are more people in a county, the chance of contact between people will be more, so the risk of infection will be increased. And because of the exponential growth, the impact of large population will be more significant. 
+
+### Classification
+
+For this part, we develope a new variable to see whether the death per 100,000 people is greater than 1. The variables we selecte to do classification are geographical identifiers, demographics, and health-related predictors. We perform some modifications to each variable. For instance, in order to make them comparable between each county, we divide each variable by the total population of that county divides 100,000. For the number of hospitals and ICU beds, we simply scale the data. Then we separate the data into train and test datasets, the training set contains 80% of the whole dataset.
+
+In order to model the new outcome, four different classification models were trained, which are k-nearest neighbors model, regularized discriminant analysis, random forest model and gradient boosting model, each using 10-fold cross-validation. The best tuning parameters were chosen using Accuracy.
+
+```{r, include = FALSE}
+unit = 100000
+c_covid19 = covid19 %>%
+  mutate(avgdeaths = factor(case_when(tot_deaths/(PopulationEstimate2018/unit) > 1 ~ "1",
+                                      TRUE ~ "0")), 
+         gender_ratio = FracMale2017,
+         old_rate = PopulationEstimate65.2017/(PopulationEstimate2018/unit),
+         demo_density = PopulationDensityperSqMile2010,
+         median_age = MedianAge2010,
+         medicare_rate = X.EligibleforMedicare2018/(PopulationEstimate2018/unit),
+         hospital_employee_rate = X.FTEHospitalTotal2017/(PopulationEstimate2018/unit),
+         mds = TotalM.D..s.TotNon.FedandFed2017/(PopulationEstimate2018/unit),
+         network = scale(X.HospParticipatinginNetwork2017),
+         hospitals = scale(X.Hospitals),
+         icu = scale(X.ICU_beds)) %>%
+  dplyr::select(avgdeaths, countyFIPS, StateName, POP_LATITUDE, POP_LONGITUDE, gender_ratio, old_rate, demo_density, median_age, medicare_rate, 16:19, hospital_employee_rate, mds, network, hospitals, icu)
+```
+
+```{r}
+ncol(c_covid19)
+```
+
+```{r, include = FALSE, message = FALSE}
+# split data
+set.seed(1)
+c_index = createDataPartition(c_covid19$StateName, p = 0.8, list = FALSE)
+c_trn = c_covid19[c_index, ]
+c_tst = c_covid19[-c_index, ]
+```
+
+```{r, accuracy, include = FALSE}
+calc_acc = function(actual, predicted) {
+  mean(actual == predicted)
+}
+```
+
+```{r, include = FALSE, message = FALSE}
+set.seed(1)
+cv = trainControl(method = "cv", number = 10)
+```
+
+```{r, include = FALSE}
+# tuning parameters: k
+knn_mod = train(form = avgdeaths ~ . - countyFIPS - StateName, data = c_trn, 
+                method = "knn", trControl = cv, metric = "Accuracy")
+
+# tuning parameters: gamma, lambda
+rda_mod = train(form = avgdeaths ~ . - countyFIPS - StateName, data = c_trn, 
+                method = "rda", trControl = cv, metric = "Accuracy")
+
+# tuning parameters: mtry
+rf_mod = train(form = avgdeaths ~ . - countyFIPS - StateName, data = c_trn, 
+               method = "rf", trControl = cv, metric = "Accuracy", importance = TRUE)
+
+# tuning parameters: nrounds, eta
+xgb_mod = train(form = avgdeaths ~ . - countyFIPS - StateName, data = c_trn, 
+                method = "xgbTree", trControl = cv, metric = "Accuracy")
+```
+
+```{r, include = FALSE}
+knn_acc = calc_acc(c_tst$avgdeaths, predict(knn_mod, c_tst))
+rda_acc = calc_acc(c_tst$avgdeaths, predict(rda_mod, c_tst))
+rf_acc = calc_acc(c_tst$avgdeaths, predict(rf_mod, c_tst))
+xgb_acc = calc_acc(c_tst$avgdeaths, predict(xgb_mod, c_tst))
+```
+
+```{r}
+tibble("Model" = c("KNN", "RDA", "Random Forest", "Gradient Boosting"),
+       "Tuning" = c("k = 7", "gamma = 0, lambda = 1", "mtry = 9", "nrounds = 100, eta = 0.3"),
+       "Training Accuracy" = c(max(knn_mod$results[, 2]), max(rf_mod$results[, 2]), 
+                               max(xgb_mod$results[, 8]), max(rda_mod$results[, 3])),
+       "Testing Accuracy" = c(knn_acc, rf_acc, xgb_acc, rda_acc)) %>% 
+  kable(digits = 3, 
+        caption = "Table: Accuracy for binary classification models") %>% 
+  kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+```{r, fig.height = 4, fig.width = 6}
+rf_cimp = importance(rf_mod$finalModel, type = 1)
+rf_cimp = rf_cimp[order(rf_cimp), ]
+
+dotchart(rf_cimp, xlab = "Mean Decrease in Accuracy", main = "Classification: Variable Importance (Random Forest)", bg = "skyblue", cex = 0.4)
+```
+
+For K-nearest neighbors, the tuning parameter is k, which represents the number of neighbors. Through 10-fold cross validation, our best tuning k is 7, and the test accuracy using the best KNN model is 63.9%. This method has the lowest testing accuracy, KNN assigns object to the class most common among its k nearest neighbors, it is a type of instance-based learning where the function is only approximated locally and all computation is deferred until function evaluation. This method is easy to understand and implement. However, A peculiarity of the KNN algorithm is that it is sensitive to the local structure of the data. As has been proved in cluster analysis, the number of counties in each cluster varies a lot, moreover, we cannot simply use mathematical distance to do classification, we real world situation is much more complicate, thus, KNN may not be a good method.
+
+For Regularized Discriminant Analysis, the best tuning parameters are gamma=0 and lambda=1, which indicates that this is a linear discriminant analysis using a covariance matrix in the model. The test accuracy of this method is 75.6%. Linear discriminant analysis attempt to express one dependent variable as a linear combination of other features or measurements and then do the classification job. LDA works when the measurements made on independent variables for each observation are continuous quantities. This method has a particularly obvious advantage in dealing with the unbalanced pattern category, thus it has the highest accuracy. 
+
+In random forest method, the best tuning is 9 randomly selected predictors, the test accuracy is 73.5%, a bit lower than that of RDA. Random forest constructs a multitude of decision trees at training time and outputs the class that is the mode of the classes or mean prediction of the individual trees. It can deal with huge number of variables and observations with high accuracy, it can also evaluate the importance of each variables. In this case, the most important variables selected make great sense. As we know, COVID-19 is a highly infectious disease, and counties with large population density are more likely to have more cases and deaths.The number of doctors and ICU beds indicates the overall medical level of this county, higher medical level will lead to less death.
+
+The best tunings for extreme gradient boosting are 100 iterations and shrinkage of 0.3, the test accuracy is 72.7%. Gradient boosting is a machine learning technique for regression and classification problems, which produces a prediction model in the form of an ensemble of weak prediction models, typically decision trees. The test accuracy is a bit lower than random forest and LDA, but still pretty good.
+
+In conclusion, combining the test accuracy and property of these four methods, LDA has the highest classification accuracy, random forest has more real world meaning and can be understood better. They are all good classification methods.
+
+### Regression
+
+#### Overviews
+
+In this part, our goal is to figure out an approach to predict the number of deaths one week from Apr 22. The basic idea here is to fit several different statistical methods with both the demographics and health-related information, and the time series of COVID-19 deaths and cases counts, and choose the best one. Both linear and non-linear models are applied, and we can find some similarity between their results, which provide us with some enlightening views.
+
+Here, we also acquire updated information at April 29 and use Mean Absolute Error (MAE) and Root Mean Square Error (RMSE) to evaluate our models.
+
+#### Predictors
+
+Since the raw data contains lots of redundant information, we start with variables selection. Based on above analysis and the paper by Prof. Bin Yu’s group [^1], four categories of variables regarding the demographics and health-related information are chosen, and we perform some extra processes to some of them to improve the comparability:
+
+- County location and density: population density per square mile (2010), latitude corresponding to county's population center, longitude corresponding to county's population center
+- County healthcare resources: number of hospitals (scaled) (2018-2019), number of ICU beds (scaled) (2018-2019)
+- County health demographics: median age (2010), number of people eligible for Medicare in county per 100,000 (2018), percentage of the population who are smokers (2017), percentage of the population with diabetes (2016), deaths due to respiratory diseases per 100,000 (2017), deaths due to heart diseases per 100,000 (2014-2016)
+- COVID-19 death counts: recent 5 days death counts, recent 1-day death counts in neighboring county.
+
+To be more specific, we accept 8 out of 9 predictors from Section 3.4 of the paper, and scale the number of hospitals and number of ICU beds to suppress the difference between counties. We add latitude and longitude to represent the location of counties. Since the latitude and longitude are recorded corresponding to county's population center, it benefits to epidemic diseases models. In addition, we take the number of people eligible for Medicare in county into consideration because of the importance of the Medicare in the United States. 
+
+For the death counts, we only use the most recent 5 days of data. Since we cannot use ARIMA, we regard them as common variables and we update the data (replace the old data with the new one) everytime when we do the prediction. For example, we use the data from April 18 to April 22 to predict the number of death in April 23, and then we just accept the prediction and use the data from April 19 to April 22 together with this predicted death (April 23) to predict the number of death in April 24. The number of death in neighboring county is considered because of the infectiousness and migration. Here, we do not exactly define neighboring county geographically. In detail, since the policy vary from state to state, we only consider the neighboring county within state. The measure is the distance between counties' population centers, which can be calculated with the variables `POP_LATITUDE` and `POP_LONGITUDE`.
+
+Out of convenience, we exclude the number of cases in this problem. On the one hand, we get almost the same accuracy when include them into our models. On the other hand, if we include those variable, we would have to construct another to predict the number of cases. In detail, when we predict the number of deaths from April 23 to April 29 in such case, we also need the value of the number of cases from April 23 to April 29, which we cannot get before April 22. Therefore, we can just ignore these variables. 
+
+For the model pattern, to guarantee that all the death counts are positive, we preform a log-transformation to deaths related predictors. The basic model pattern (linear) is shown as following:
+
+$$
+log(Deaths_{t_0}) = \beta_0 + \beta_1log(Deaths_{t_1}+1) + ...+ \beta_5log(Deaths_{t_5}+1) + \beta_6P_1 + ...+ \beta_{5+i}P_i,
+$$
+
+where $P_i$ are the set of demographic and healthcare-related features (such as population density, median age), $Deaths_{t_i}$ are the number of recent 5 days deaths.
+
+```{r}
+neighbor_location = function(i, data){
+  id = data[i, 1]
+  # StateName: [, 3], which state
+  n_index = which(as.factor(state_index) == data[i, 2])
+  pre = neighbor_county[[n_index]]
+  
+  i_index = which(pre[, 1] == id)
+  
+  # row number
+  c_index = neighbor_county3[[n_index]][i_index, 1]
+  nbc_index = neighbor_county3[[n_index]][i_index, 2]
+  
+  return(list("nb1" = nbc_index))
+}
+```
+
+```{r, include = FALSE}
+unit = 100000
+
+sub_candd = covid19 %>%
+  dplyr::select(141:146, 233:238)
+
+log_candd = log(sub_candd + 1)
+
+r_covid19 = covid19 %>%
+  mutate(demo_density = PopulationDensityperSqMile2010,
+         median_age = MedianAge2010,
+         medicare_rate = X.EligibleforMedicare2018/(PopulationEstimate2018/unit),
+         hospitals = scale(X.Hospitals),
+         icu = scale(X.ICU_beds)) %>%
+  dplyr::select(countyFIPS, StateName, CountyName, POP_LATITUDE, POP_LONGITUDE, demo_density, median_age, medicare_rate, 16:19, hospitals, icu)
+
+r_covid19 = cbind(r_covid19, log_candd)
+```
+
+```{r}
+head(r_covid19)
+```
+
+```{r, include = FALSE}
+# neighboring counties
+nb_deaths0421 = matrix(NA, nrow(r_covid19), 1)
+nb_deaths0422 = matrix(NA, nrow(r_covid19), 1)
+for (i in 1:nrow(r_covid19)){
+  id_nb = neighbor_location(i, r_covid19)
+  
+  nb_0421d = r_covid19[id_nb$nb1, 25]
+  nb_0422d = r_covid19[id_nb$nb1, 26]
+  
+  nb_deaths0421[i, ] = nb_0421d
+  nb_deaths0422[i, ] = nb_0422d
+}
+
+r_covid19_nb = cbind(r_covid19, cbind(nb_deaths0421, nb_deaths0422))
+names(r_covid19_nb)[27:28] = c("nb_deaths0421", "nb_deaths0422")
+```
+
+```{r}
+# acquire updated information
+covid_new = read.csv("https://raw.githubusercontent.com/Yu-Group/covid19-severity-prediction/master/data/county_level/processed/nytimes_infections/nytimes_infections.csv", header = TRUE) 
+
+covid_updated = covid_new%>%
+  dplyr::select(countyFIPS, 95:101, 209:215)
+
+countyFIPS = as.character(covid_updated[, 1])
+
+for (i in 1:293){
+  county_id = substring(covid_updated[i, 1], 2, 5)
+  countyFIPS[i] = county_id
+}
+
+countyFIPS = as.factor(countyFIPS)
+
+covid_new = as.data.frame(cbind(countyFIPS, covid_updated[, -1]))
+```
+
+```{r, include = FALSE}
+covid19_new = merge(r_covid19_nb, covid_new, by = "countyFIPS", all = F)
+colnames(covid19_new)[15:28] = c("cases_t5", "cases_t4", "cases_t3", "cases_t2", "cases_t1", 
+    "cases_t0", "deaths_t5", "deaths_t4", "deaths_t3", "deaths_t2", 
+    "deaths_t1", "deaths_t0", "nb_deaths_t1", "nb_deaths_t0")
+```
+
+```{r}
+covid19_trn = covid19_new %>%
+  dplyr::select(4:14, 21:27)
+
+covid19_tst01 = covid19_new %>%
+  dplyr::select(1:2, 4:14, 21:28) %>%
+  mutate(deaths_t5 = deaths_t4, deaths_t4 = deaths_t3, deaths_t3 = deaths_t2, 
+         deaths_t2 = deaths_t1, deaths_t1 = deaths_t0, nb_deaths_t1 = nb_deaths_t0) %>%
+  dplyr::select(-deaths_t0, -nb_deaths_t0)
+```
+
+#### Modeling & Discussion
+
+In order to predict the number of deaths, four different regression models are trained: random forest model, linear models, generalized additive model and k-nearest neighbors model. Out of bag samples and 10-fold cross-validation are used. The best tuning parameters are chosen using RMSE. 
+
+The k-nearest neighbors model may have bad performance because of the dimensionality issue, and we just consider it for comparison.
+
+```{r}
+calc_rmse = function(actual, predicted) {
+  sqrt(mean( (actual - predicted) ^ 2) )
+}
+
+calc_mae = function(actual, predict){
+  mean(abs(actual - predict))
+}
+```
+
+For the random forest model, we fit the training data via the `randomForest` package. The tuning parameter here is `mtry`, and out of bag samples are used to tune the best parameter. The result shows that the best `mtry` should be 9, which means that the best number of randomly selected predictors is 9. Random forest always perform well, but also the interpretation is usually more difficult. In order to illustrate, we can obtain the variable importance plot to see what set of predictors are important for us to do the prediction. 
+
+```{r}
+set.seed(1)
+# random forest
+rf_rmod_exp = train(form = deaths_t0 ~ ., data = covid19_trn, method = "rf", 
+                    trControl = trainControl(method = "oob"), metric = "RMSE", importance = TRUE)
+```
+
+```{r, fig.height = 4, fig.width = 6}
+rf_imp = importance(rf_rmod_exp$finalModel, type = 1)
+rf_imp = rf_imp[order(rf_imp), ]
+
+dotchart(rf_imp, xlab = "Mean Decrease in Accuracy", main = "Regression: Variable Importance (Random Forest)", bg = "skyblue", cex = 0.4)
+```
+
+The variable importance plot above represents the mean decrease in accuracy for each predictor. Fortunately, the results make sense intuitively. Initially, the number of recent 5 days deaths are of most importance. Since it is actually a time series problem, it is reasonable that the response is highly related to its lag orders. Apart from these predictors, population density, location (county's population center) and the number of recent 1 day deaths in neighboring county contribute more, and all the three predictors are related to close contact, which should be avoid during epidemic. The number of ICU beds represent the medical level of the county, which shares almost the same importance as the number of deaths in neighboring county.
+
+For linear model, we fit the training data via the `glmnet` package, using 10-fold cross-validation to tune elasticnet mixing percentage `alpha` and regularization parameter `lambda`. If $alpha = 0$, the model would be Ridge regression model; if $alpha = 1$, the model would be Lasso regression model; if between 0 and 1, it would be Elastic Net model. The result turns out that the best tuning parameters are $alpha = 1$ and $lambda = 0$. Check for the coefficients, we can find that only `deaths_t1` has non-zero coefficient, which is about 0.97. The variable importance table shows that only recent 3 days deaths counts are important. Since Lasso is a pretty strict model, those predictors with less influence tend to be removed.
+
+```{r}
+set.seed(1)
+cv = trainControl(method = "cv", number = 10)
+```
+
+```{r}
+set.seed(1)
+# glm
+glm_rmod_exp = train(form = deaths_t0 ~ ., data = covid19_trn, method = "glmnet", 
+                   trControl = cv, metric = "RMSE", importance = TRUE)
+glm_coef = coef.glmnet(glm_rmod_exp$finalModel)
+```
+
+```{r}
+glm_rmod_exp$bestTune
+```
+
+```{r}
+glm_imp = varImp(glm_rmod_exp$finalModel)
+tibble("Predictor" = "Overall",
+       "deaths_t1" = glm_imp[16, ],
+       "deaths_t2" = glm_imp[15, ],
+       "deaths_t3" = glm_imp[14, ]) %>% 
+  kable(digits = 6, 
+        caption = "Variable Importance (GLM | Non-zero part)") %>% 
+  kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+For generalized additive model, we fit the training data via the `mgcv` package, using 10-fold cross-validation to tune feature selection `select` and method `method`. The best parameter is that `select` = FALSE, and `method` = GCV.Cp, which means that each predictor can not be penalized to zero and using generalized cross validation (GCV) for unknown scale parameter and Mallows' Cp for known scale. Checking for variable importance table, still we get really high value in `deaths_t1`. Age issue is also important in the method.
+
+```{r}
+set.seed(1)
+# Generalized Additive Models
+gam_rmod_exp = train(form = deaths_t0 ~ ., data = covid19_trn, method = "gam", 
+                   trControl = cv, metric = "RMSE", importance = TRUE)
+```
+
+```{r}
+gam_imp = varImp(gam_rmod_exp$finalModel)
+tibble("Predictor" = "Overall",
+       "deaths_t1" = "Inf",
+       "median_age" = gam_imp[10, ],
+       "demo_density" = gam_imp[13, ],
+       "POP_LONGITUDE" = gam_imp[16, ]) %>% 
+  kable(digits = 2, 
+        caption = "Variable Importance (GAM | Greater than 1)") %>% 
+  kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+For KNN model, the best tuning parameter is $k = 7$. Since the KNN model here is just for comparison, see detail interpretations in the `Prediction` part.
+
+```{r}
+set.seed(1)
+# knn
+knn_rmod_exp = train(form = deaths_t0 ~ ., data = covid19_trn,
+                 method = "knn", trControl = cv, metric = "RMSE")
+```
+
+```{r}
+tibble("Model" = "Tuning",
+       "Random Forest" = "mtry = 9",
+       "Linear (Lasso)" = "alpha = 1, lambda = 0",
+       "GAM" = "select = FALSE, method = GCV.Cp",
+       "KNN" = "k = 7") %>% 
+  kable(caption = "Summary for Regression Models") %>% 
+  kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+#### Prediction
+
+With the updated data, we can check over the models by calculating testing RMSE and MAE. This updated dataset is also from Prof. Bin Yu’s group have some counties missing in the dataset, but it is actually the best dataset we can obtain from Prof. Bin Yu’s group.
+
+As we have mentioned above, we need to update the data (replace the old data with the new one) everytime when doing the prediction. In detail, we renew the number of recent 5 days deaths and the number of recent 1 day deaths in neighboring county. Unsurprisingly, the bias of the predictions tend to become larger and larger, since we keep using inaccurate data.
+
+```{r}
+# new neighbor county
+neighbor_county_new = list() # pairs of countyFIPS
+for (n in 1:length(state_index)){
+  # subset
+  neighbor = covid19_new %>%
+    filter(StateName == state_index[n]) %>%
+    dplyr::select(countyFIPS, POP_LATITUDE, POP_LONGITUDE)
+  
+  # calculate distance
+  alldist = as.matrix(dist(neighbor[, -1], method = "euclidean", upper = TRUE, diag = 0))
+  
+  nc = matrix(NA, nrow(neighbor), 2) # countyFIP
+  for (i in 1:nrow(neighbor)){
+    index = which.min(alldist[-i, i])
+    subnc = matrix(c(neighbor$countyFIPS[i], neighbor$countyFIPS[index]), 1, 2)
+    nc[i, ] = subnc
+  }
+  neighbor_county_new[[n]] = nc
+}
+
+# function: nb_deaths
+nb_deaths = function(data){
+  # data = covid19_tst02
+  nb_deaths_t0 = c()
+  for (i in 1:nrow(data)){
+    id = data[i, 1]
+    n_index = which(as.factor(state_index) == data[i, 2])
+    substate = neighbor_county_new[[n_index]]
+  
+    i_index = which(substate[, 1] == id)
+    nbc_id = substate[i_index, 2]
+    nbc_row = which(data[, 1] == nbc_id)
+    nbd = data[nbc_row, 20]
+    nb_deaths_t0 = c(nb_deaths_t0, nbd)
+  }
+  return(nb_deaths_t0)
+}
+```
+
+```{r}
+rf_p23 = predict(rf_rmod_exp, covid19_tst01[, 3:19])
+rf_rmse_23 = calc_rmse(covid19_new$X.Deaths_04.23.2020, exp(rf_p23) - 1)
+rf_mae_23 = calc_mae(covid19_new$X.Deaths_04.23.2020, exp(rf_p23) - 1)
+
+covid19_tst_r = covid19_tst01; rf_pred = rf_p23
+rf_prediction = matrix(NA, nrow(covid19_new), 7)
+rf_rmse = c(); rf_mae = c()
+for (t in 1:6){
+  covid19_r = cbind(covid19_tst_r, rf_pred)
+  nb_deaths_t0 = nb_deaths(covid19_r)
+  covid19_r_pre = cbind(covid19_r, nb_deaths_t0)
+  colnames(covid19_r_pre)[20] = c("deaths_t0")
+  
+  covid19_tst_r = covid19_r_pre %>%
+    mutate(deaths_t5 = deaths_t4, deaths_t4 = deaths_t3, deaths_t3 = deaths_t2,
+           deaths_t2 = deaths_t1, deaths_t1 = deaths_t0, nb_deaths_t1 = nb_deaths_t0) %>%
+    dplyr::select(-deaths_t0, -nb_deaths_t0)
+  
+  rf_pred = predict(rf_rmod_exp, covid19_tst_r[, 3:19])
+  rf_index = 36 + t
+  rf_rmse_s = calc_rmse(covid19_new[, rf_index], exp(rf_pred) - 1)
+  rf_mae_s = calc_mae(covid19_new[, rf_index], exp(rf_pred) - 1)
+  
+  rf_prediction[, t+1] = round(exp(rf_pred) - 1, 0)
+  rf_rmse = c(rf_rmse, rf_rmse_s)
+  rf_mae = c(rf_mae, rf_mae_s)
+}
+
+rf_prediction[, 1] = round(exp(rf_p23) - 1, 0)
+rf_rmse = c(rf_rmse_23, rf_rmse)
+rf_mae = c(rf_mae_23, rf_mae)
+
+total_rf_rmse = sum(rf_rmse)
+total_rf_mae = sum(rf_mae)
+```
+
+```{r}
+# glm
+glm_p23 = predict(glm_rmod_exp, covid19_tst01[, 3:19])
+glm_rmse_23 = calc_rmse(covid19_new$X.Deaths_04.23.2020, exp(glm_p23) - 1)
+glm_mae_23 = calc_mae(covid19_new$X.Deaths_04.23.2020, exp(glm_p23) - 1)
+
+glm_pred = glm_p23
+glm_prediction = matrix(NA, nrow(covid19_new), 7)
+glm_rmse = c(); glm_mae = c()
+for (t in 1:6){
+  covid19_r = cbind(covid19_tst_r, glm_pred)
+  nb_deaths_t0 = nb_deaths(covid19_r)
+  covid19_r_pre = cbind(covid19_r, nb_deaths_t0)
+  colnames(covid19_r_pre)[20] = c("deaths_t0")
+  
+  covid19_tst_r = covid19_r_pre %>%
+  mutate(deaths_t5 = deaths_t4, deaths_t4 = deaths_t3, deaths_t3 = deaths_t2,
+         deaths_t2 = deaths_t1, deaths_t1 = deaths_t0, nb_deaths_t1 = nb_deaths_t0) %>%
+  dplyr::select(-deaths_t0, -nb_deaths_t0)
+  
+  glm_pred = predict(glm_rmod_exp, covid19_tst_r[, 3:19])
+  glm_index = 36 + t
+  glm_rmse_s = calc_rmse(covid19_new[, glm_index], exp(glm_pred) - 1)
+  glm_mae_s = calc_mae(covid19_new[, glm_index], exp(glm_pred) - 1)
+  
+  glm_prediction[, t+1] = round(exp(glm_pred) - 1, 0)
+  glm_rmse = c(glm_rmse, glm_rmse_s)
+  glm_mae = c(glm_mae, glm_mae_s)
+}
+
+glm_prediction[, 1] = round(exp(glm_p23) - 1, 0)
+glm_rmse = c(glm_rmse_23, glm_rmse)
+glm_mae = c(glm_mae_23, glm_mae)
+
+total_glm_rmse = sum(glm_rmse)
+total_glm_mae = sum(glm_mae)
+```
+
+```{r}
+gam_p23 = predict(gam_rmod_exp, covid19_tst01[, 3:19])
+gam_rmse_23 = calc_rmse(covid19_new$X.Deaths_04.23.2020, exp(gam_p23) - 1)
+gam_mae_23 = calc_mae(covid19_new$X.Deaths_04.23.2020, exp(gam_p23) - 1)
+
+gam_pred = gam_p23
+gam_prediction = matrix(NA, nrow(covid19_new), 7)
+gam_rmse = c(); gam_mae = c()
+for (t in 1:6){
+  covid19_r = cbind(covid19_tst_r, gam_pred)
+  nb_deaths_t0 = nb_deaths(covid19_r)
+  covid19_r_pre = cbind(covid19_r, nb_deaths_t0)
+  colnames(covid19_r_pre)[20] = c("deaths_t0")
+  
+  covid19_tst_r = covid19_r_pre %>%
+    mutate(deaths_t5 = deaths_t4, deaths_t4 = deaths_t3, deaths_t3 = deaths_t2,
+           deaths_t2 = deaths_t1, deaths_t1 = deaths_t0, nb_deaths_t1 = nb_deaths_t0) %>%
+    dplyr::select(-deaths_t0, -nb_deaths_t0)
+  
+  gam_pred = predict(rf_rmod_exp, covid19_tst_r[, 3:19])
+  gam_index = 36 + t
+  gam_rmse_s = calc_rmse(covid19_new[, gam_index], exp(gam_pred) - 1)
+  gam_mae_s = calc_mae(covid19_new[, gam_index], exp(gam_pred) - 1)
+  
+  gam_prediction[, t+1] = round(exp(gam_pred) - 1, 0)
+  gam_rmse = c(gam_rmse, gam_rmse_s)
+  gam_mae = c(gam_mae, gam_mae_s)
+}
+
+gam_prediction[, 1] = round(exp(gam_p23) - 1, 0)
+gam_rmse = c(gam_rmse_23, gam_rmse)
+gam_mae = c(gam_mae_23, gam_mae)
+
+total_gam_rmse = sum(gam_rmse)
+total_gam_mae = sum(gam_mae)
+```
+
+```{r}
+knn_p23 = predict(knn_rmod_exp, covid19_tst01[, 3:19])
+knn_rmse_23 = calc_rmse(covid19_new$X.Deaths_04.23.2020, exp(knn_p23) - 1)
+knn_mae_23 = calc_mae(covid19_new$X.Deaths_04.23.2020, exp(knn_p23) - 1)
+
+knn_pred = knn_p23
+knn_prediction = matrix(NA, nrow(covid19_new), 7)
+knn_rmse = c(); knn_mae = c()
+for (t in 1:6){
+  covid19_r = cbind(covid19_tst_r, knn_pred)
+  nb_deaths_t0 = nb_deaths(covid19_r)
+  covid19_r_pre = cbind(covid19_r, nb_deaths_t0)
+  colnames(covid19_r_pre)[20] = c("deaths_t0")
+  
+  covid19_tst_r = covid19_r_pre %>%
+  mutate(deaths_t5 = deaths_t4, deaths_t4 = deaths_t3, deaths_t3 = deaths_t2,
+         deaths_t2 = deaths_t1, deaths_t1 = deaths_t0, nb_deaths_t1 = nb_deaths_t0) %>%
+  dplyr::select(-deaths_t0, -nb_deaths_t0)
+  
+  knn_pred = predict(knn_rmod_exp, covid19_tst_r[, 3:19])
+  knn_index = 36 + t
+  knn_rmse_s = calc_rmse(covid19_new[, knn_index], exp(knn_pred) - 1)
+  knn_mae_s = calc_mae(covid19_new[, knn_index], exp(knn_pred) - 1)
+  
+  knn_prediction[, t+1] = round(exp(knn_pred) - 1, 0)
+  knn_rmse = c(knn_rmse, knn_rmse_s)
+  knn_mae = c(knn_mae, knn_mae_s)
+}
+
+knn_prediction[, 1] = round(exp(knn_p23) - 1, 0)
+knn_rmse = c(knn_rmse_23, knn_rmse)
+knn_mae = c(knn_mae_23, knn_mae)
+
+total_knn_rmse = sum(knn_rmse)
+total_knn_mae = sum(knn_mae)
+```
+
+```{r}
+tibble("Model" = c("Random Forest", "Linear Model", "GAM", "KNN"),
+       "April 23" = c(rf_mae[1], glm_mae[1], gam_mae[1], knn_mae[1]),
+       "April 24" = c(rf_mae[2], glm_mae[2], gam_mae[2], knn_mae[2]),
+       "April 25" = c(rf_mae[3], glm_mae[3], gam_mae[3], knn_mae[3]),
+       "April 26" = c(rf_mae[4], glm_mae[4], gam_mae[4], knn_mae[4]),
+       "April 27" = c(rf_mae[5], glm_mae[5], gam_mae[5], knn_mae[5]),
+       "April 28" = c(rf_mae[6], glm_mae[6], gam_mae[6], knn_mae[6]),
+       "April 29" = c(rf_mae[7], glm_mae[7], gam_mae[7], knn_mae[7])) %>% 
+  kable(digits = 3, 
+        caption = "Daily MAE for Regression Models") %>% 
+  kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+```{r}
+tibble("Model" = c("Random Forest", "Linear Model", "GAM", "KNN"),
+       "April 23" = c(rf_rmse[1], glm_rmse[1], gam_rmse[1], knn_rmse[1]),
+       "April 24" = c(rf_rmse[2], glm_rmse[2], gam_rmse[2], knn_rmse[2]),
+       "April 25" = c(rf_rmse[3], glm_rmse[3], gam_rmse[3], knn_rmse[3]),
+       "April 26" = c(rf_rmse[4], glm_rmse[4], gam_rmse[4], knn_rmse[4]),
+       "April 27" = c(rf_rmse[5], glm_rmse[5], gam_rmse[5], knn_rmse[5]),
+       "April 28" = c(rf_rmse[6], glm_rmse[6], gam_rmse[6], knn_rmse[6]),
+       "April 29" = c(rf_rmse[7], glm_rmse[7], gam_rmse[7], knn_rmse[7])) %>% 
+  kable(digits = 3, 
+        caption = "Daily RMSE for Regression Models") %>% 
+  kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+```{r}
+tibble("Model" = c("Total RMSE", "Total MAE"),
+       "Random Forest" = c(total_rf_rmse, total_rf_mae),
+       "Linear Model" = c(total_glm_rmse, total_glm_mae), 
+       "GAM" = c(total_gam_rmse, total_gam_mae), 
+       "KNN"= c(total_knn_rmse, total_knn_mae)) %>% 
+  kable(digits = 3,
+        caption = "RMSE | MAE (7-Days) for Regression Models") %>% 
+  kable_styling("striped", full_width = FALSE, position = "center", font_size = 8)
+```
+
+Based on the results, we can find that the KNN model is not a proper method here. Both RMSE and MAE are much larger than other models. From the best tuning parameter k = 7, we know that KNN model use 7 nearest neighbor to predict the deaths number. However, such neighbor is the mathematical neighbors, not the geographical neighbors. Since our predictors contain both demographics & health-related information and time series, contain too much noise, we actually need to do some model selection, and KNN can not achieve this goal.
+
+For the random forest model, linear model and generalized additive model, we get acceptable results. Overall speaking, generalized additive model have the best performance in both short-term (3 days) and long-term (7 days). Random forest model has relatively stable performance. linear model, Lasso, perform well in short-term, but become worse in long-term. According to above discussion, we know that only one predictor is left in the linear model, and that is why the long term predictions are bad here.
+
+Although generalized additive model has better RMSE and MAE, we still want to choose random forest model as our final model. The first reason is that we need a stable model to help us do the prediction. The second reason if that random forest model can be explained and contains more real world meaning.
+
+```{r}
+covid19_0429 = cbind(covid19_new[, 1:5], rf_prediction[, 7]) %>%
+  mutate(death_level = factor(case_when(
+    rf_prediction[, 7] == 0 ~ "0",
+    rf_prediction[, 7] > 0 & rf_prediction[, 7] <= 100  ~ "1",
+    rf_prediction[, 7] > 100 & rf_prediction[, 7] <= 200 ~ "2",
+    rf_prediction[, 7] > 200 & rf_prediction[, 7] <= 400 ~ "3",
+    rf_prediction[, 7] > 400 & rf_prediction[, 7] <= 800 ~ "4",
+    rf_prediction[, 7] > 800 & rf_prediction[, 7] <= 1500 ~ "5",
+    TRUE ~ "6")))
+```
+
+```{r, warning = FALSE, fig.width = 6, fig.height = 3, fig.align = "center"}
+# plot the geographical distribution of clusters
+covid_d = as.data.frame(cbind(cluster = covid19_0429$death_level, lat = covid19_0429$POP_LATITUDE, lon = covid19_0429$POP_LONGITUDE))
+ggplot(covid_d, aes(x = lon, y = lat)) + 
+  geom_point(aes(col = cluster), cex = 0.9) +
+  xlim(c(-130, -60)) + ylim(c(27, 50)) +
+  labs(title = "The number of deaths on April 29 (Prediction)", x = "Longitude", y = "Latitude") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_gradient(low = "orange", high = "darkred")
+```
+
+#### Improvement
+
+From the perspective of prediction, the are some methods to improve the accuracy. Initially, the model can be built for each county respectively. Differences in medical level, population and policies lead to gaps between counties, which undermine the effect of the data. For those unrelated counties, interaction from data produces negative side effect and make the predictions less accurate. To achieve the goal, we need more data for each county and we may consider to extend time periods to the beginning of the epidemic or the day with first death occurred.
+
+## Conclusion
+
+From the result of previous analysis, we can find the most vulnerable population to corona virus and some feasible prevention measures to reduce mortality. All of previous analysis show that the population and diseases are important factors related to COVID-19 case and death counts. 
+
+According to the result of clustering, we consider people who live in the big cities where has more population density and people have diseases will be more vulnerable to COVID-19. It can make sense in the real-world situation. As we know, COVID-19 is a highly infectious disease. The higher population density a county has, the higher the incidence of disease among the population. The four diseases mentioned above all contribute to the risk of getting corona virus. The immunity and resistance of diabetic, heart disease and stroke patients are not as good as normal people. Besides, high blood sugar is easy to provide a very good environment for bacteria and germs, thus, people with diabetes are more likely to get infected.  Smokers are likely to be more vulnerable to COVID-19 as the act of smoking means that fingers are in contact with lips, which increases the possibility of transmission of virus from hand to mouth. Smokers may also already have lung disease or reduced lung capacity which would greatly increase risk of serious illness. Conditions that increase oxygen needs or reduce the ability of the body to use it properly will put patients at higher risk of serious lung conditions such as pneumonia. Thus, people live cities with high density and have diseases will be more vulnerable.
+
+For prevention measures to reduce mortality, we can also get some ideas from our analysis. Classification analysis shows some more factors related to COVID-19. One is the longitude corresponding to county's population center and the other is the number of medical doctors and ICU beds in each county. Most high population density counties such as New York are at the east of the United States. All these counties tend to have higher growth of the confirmed case and death counts. The number of medical doctors and ICU beds indicate the medical level of each county. Although there has not been an effective method to treat the corona virus, with good amount of knowledge and professional medical care, the death rate of this horrible disease may drop a little bit. For the regression part, we can see that the most significant variables are the number of death five days before. Same as the results of cluster and classification analysis, the population density of each county, the percentage of diseases, the number of hospitals and ICU beds can have a big influence.
+
+Thus, we consider several ways to reduce mortality:
+
+- Corona virus can spread rapidly among the crowd. Since the population in the county cannot be reduced, we can separate ourselves from others by avoiding going to crowded places such as restaurants and public parks and simply staying at home to prevent contact with others.
+- Develop healthy living habits, through more exercise and healthier diets, we can reduce the risk of getting other diseases and enhance self-immunity at the same time.
+- Medicare and the number of medical facilities are important to reduce deaths of corona virus. It is difficult to build more hospitals or create more ICU beds, however, many severe patients may need ventilator to assist breathing, thus, we can try to manufacture more ventilators or import from other countries to help reduce mortality.
+
+There are still some deficiencies in our model and we can make some improvements in the future. We can build model for each county only using the data from this county and make a prediction for this county. Besides, we can consider more influential factors into our model. For example, the policy of stay at home can change the growth trend of COVID-19 counts. Because if people stay at home, it will reduce their contact with others such that reduce the risk of infection. Taking these factors into consideration will be helpful to improve the accuracy of our model.
+
+[^1]: [Curating a COVID-19 data repository and forecasting county-level death counts in the United States](https://www.stat.berkeley.edu/~binyu/ps/papers2020/covid19_paper.pdf)
+[^2]: [Trends and prediction in daily incidence and deaths of COVID-19 in the United States: a search-interest based model](https://www.medrxiv.org/content/10.1101/2020.04.15.20064485v1)
+[^3]: [Prediction of Coronavirus Disease (covid-19) Evolution in USA with the Model Based on the Eyring Rate Process Theory and Free Volume Concept](https://www.medrxiv.org/content/10.1101/2020.04.16.20068692v2)
+[^4]: [Report 9: Impact of non-pharmaceutical interventions (NPIs) to reduce COVID-19 mortality and healthcare demand](https://www.imperial.ac.uk/media/imperial-college/medicine/sph/ide/gida-fellowships/Imperial-College-COVID19-NPI-modelling-16-03-2020.pdf)
